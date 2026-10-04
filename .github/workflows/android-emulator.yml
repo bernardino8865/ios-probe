@@ -177,28 +177,36 @@ jobs:
       - name: Criar o emulador com páginas de 16 KB
         run: |
           set -euo pipefail
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
           "$SDKMANAGER" "emulator" "${IMAGE}" | tail -3
           echo no | "$AVDMANAGER" create avd -n sixteenkb -k "${IMAGE}" --device "pixel_6" --force
-          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "--- avdmanager list avd"; "$AVDMANAGER" list avd
+          echo "--- arquivos"; ls -la "$ANDROID_AVD_HOME"
+          "$ANDROID_HOME/emulator/emulator" -list-avds
 
       - name: Subir o emulador
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
           nohup "$ANDROID_HOME/emulator/emulator" -avd sixteenkb -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -memory 3072 > emulator.log 2>&1 &
-          "$ANDROID_HOME/platform-tools/adb" wait-for-device
-          for i in $(seq 1 90); do
-            booted=$("$ANDROID_HOME/platform-tools/adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+          sleep 20
+          echo "--- emulator.log (início)"; head -20 emulator.log
+          timeout 240 "$ADB" wait-for-device || { echo "O emulador NÃO apareceu no adb"; tail -40 emulator.log; exit 1; }
+          booted=""
+          for i in $(seq 1 60); do
+            booted=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
             [ "$booted" = "1" ] && break
             sleep 5
           done
           echo "boot_completed=$booted"
-          "$ANDROID_HOME/platform-tools/adb" shell getconf PAGE_SIZE
-          "$ANDROID_HOME/platform-tools/adb" shell uname -r
-
+          [ "$booted" = "1" ] || { echo "O Android NÃO terminou de iniciar"; tail -40 emulator.log; exit 1; }
+          "$ADB" shell getconf PAGE_SIZE
+          "$ADB" shell uname -r
       - name: Instalar, abrir o app e ler o log
         run: |
           set -o pipefail
