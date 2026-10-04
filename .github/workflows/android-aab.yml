@@ -1,0 +1,183 @@
+name: Android AAB e alinhamento de 16 KB (matriz de .NET)
+
+# Exporta um AAB de release do projeto mínimo com Godot 4.7.1 mono para cada versão de .NET e confere se TODAS as bibliotecas nativas
+# estão alinhadas a 16 KB (exigência da Google Play para apps que miram Android 15+).
+#   net8.0  = controle (esperado: FALHA no alinhamento, o runtime Mono do .NET 8 é de 4 KB)
+#   net9.0  = o template pré-compilado de Android do Godot já usa .NET 9
+#   net10.0 = LTS até nov/2028; o relato godot#118989 diz que dá erro com o template pré-compilado: este job confirma ou não
+# Só roda pelo botão "Run workflow". Chave de assinatura DESCARTÁVEL (gerada aqui): este AAB não serve para publicar.
+
+on:
+  workflow_dispatch:
+
+env:
+  GODOT_RELEASE: 4.7.1-stable
+  GODOT_TEMPLATES: 4.7.1.stable.mono
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  aab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        tfm: [net8.0, net9.0, net10.0]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Componentes do Android SDK (os que o Godot 4.7.1 pede)
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          ls "$ANDROID_HOME" || true
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "build-tools;36.1.0" "platforms;android-36" "cmdline-tools;latest" | tail -5
+
+      - name: Instalar Godot mono e os templates de export
+        run: |
+          set -euo pipefail
+          base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_RELEASE}"
+          curl -fL --retry 3 -o godot.zip "${base}/Godot_v${GODOT_RELEASE}_mono_linux_x86_64.zip"
+          unzip -q godot.zip -d godot_app
+          curl -fL --retry 3 -o templates.tpz "${base}/Godot_v${GODOT_RELEASE}_mono_export_templates.tpz"
+          unzip -q templates.tpz -d tpl
+          dest="$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}"
+          mkdir -p "$dest"
+          mv tpl/templates/* "$dest/"
+          ls "$dest" | head -40
+          exe=$(find godot_app -type f -name "Godot_v*" ! -name "*.zip" | head -1)
+          chmod +x "$exe"
+          echo "GODOT=$PWD/$exe" >> "$GITHUB_ENV"
+
+      - name: Modelo de build do Android (o que "Instalar modelo de build" faz no editor)
+        run: |
+          set -euo pipefail
+          src="$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}/android_source.zip"
+          mkdir -p android/build
+          unzip -q "$src" -d android/build
+          echo -n "${GODOT_TEMPLATES}" > android/.build_version
+          : > android/.gdignore
+          : > android/build/.gdignore
+          chmod +x android/build/gradlew
+          ls android/build | head -20
+
+      - name: Mirar o .NET da matriz só no Android
+        run: |
+          python3 - <<'PY'
+          import os, re
+          tfm = "${{ matrix.tfm }}"
+          path = "IosProbe.csproj"
+          text = open(path, encoding="utf-8").read()
+          line = f'    <TargetFramework Condition="\'$(GodotTargetPlatform)\' == \'android\'">{tfm}</TargetFramework>\n'
+          text = text.replace("  </PropertyGroup>", line + "  </PropertyGroup>", 1)
+          open(path, "w", encoding="utf-8").write(text)
+          print(text)
+          PY
+
+      - name: Preset de export do Android (AAB, arm64, sem comprimir as bibliotecas nativas)
+        run: |
+          cat >> export_presets.cfg <<'EOF'
+
+          [preset.1]
+
+          name="Android"
+          platform="Android"
+          runnable=true
+          advanced_options=false
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter="data/*"
+          exclude_filter=""
+          export_path="build/android/IosProbe.aab"
+          patches=PackedStringArray()
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          seed=0
+          encrypt_pck=false
+          encrypt_directory=false
+          script_export_mode=2
+
+          [preset.1.options]
+
+          gradle_build/use_gradle_build=true
+          gradle_build/gradle_build_directory=""
+          gradle_build/android_source_template=""
+          gradle_build/compress_native_libraries=false
+          gradle_build/export_format=1
+          gradle_build/min_sdk=""
+          gradle_build/target_sdk=""
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=true
+          architectures/x86=false
+          architectures/x86_64=false
+          version/code=1
+          version/name="1.0"
+          package/unique_name="com.example.iosprobe"
+          package/name="IosProbe"
+          package/signed=true
+          package/app_category=2
+          screen/immersive_mode=true
+          EOF
+          tail -40 export_presets.cfg | head -12
+
+      - name: Configurar o editor do Godot (caminhos do SDK e do Java) e a chave descartável
+        run: |
+          set -euo pipefail
+          "$GODOT" --headless --path . --quit 2>&1 | tail -3 || true
+          cfg=$(find "$HOME/.config/godot" -name "editor_settings-*.tres" | head -1 || true)
+          echo "arquivo de configuração do editor: ${cfg:-NENHUM}"
+          if [ -z "${cfg}" ]; then
+            mkdir -p "$HOME/.config/godot"; cfg="$HOME/.config/godot/editor_settings-4.7.tres"
+            printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\n' > "$cfg"
+          fi
+          printf 'export/android/android_sdk_path = "%s"\nexport/android/java_sdk_path = "%s"\n' "$ANDROID_HOME" "$JAVA_HOME" >> "$cfg"
+          tail -5 "$cfg"
+          keytool -genkeypair -v -keystore "$PWD/disposable.keystore" -storepass android -keypass android \
+            -alias probe -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=probe" > /dev/null 2>&1
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$PWD/disposable.keystore" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=probe" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=android" >> "$GITHUB_ENV"
+
+      - name: Importar o projeto
+        run: |
+          "$GODOT" --headless --path . --import 2>&1 | tee import.log || true
+
+      - name: Exportar o AAB de release
+        run: |
+          set -o pipefail
+          mkdir -p build/android
+          "$GODOT" --headless --path . --export-release "Android" build/android/IosProbe.aab 2>&1 | tee export.log
+          ls -la build/android
+
+      - name: Conferir o alinhamento de 16 KB de todas as bibliotecas
+        run: |
+          set -o pipefail
+          python3 tools/check_elf_alignment.py build/android/IosProbe.aab 2>&1 | tee alignment.log
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.tfm }}
+          if-no-files-found: warn
+          path: |
+            import.log
+            export.log
+            alignment.log
+            build/android/IosProbe.aab
