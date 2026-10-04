@@ -1,0 +1,228 @@
+name: Android no emulador de 16 KB (fumaça, .NET 8 x .NET 10)
+
+# Exporta o projeto mínimo para Android (x86_64, para rodar no emulador do CI), instala num EMULADOR COM PÁGINAS DE 16 KB (a condição que a
+# Google Play passou a exigir) e confere pelo log do Android se o app abre e imprime "[PROBE] RESULT: PASS".
+#   net8.0  = controle: o runtime Mono do .NET 8 tem as bibliotecas alinhadas a 4 KB; num sistema de 16 KB o esperado é NÃO carregar.
+#   net10.0 = o que o Mini Campus usa no Android: o esperado é abrir e dar PASS.
+# Limite: o emulador do CI é x86_64 (testa o runtime x86_64, não o arm64 que vai para o celular) e não substitui um aparelho de verdade.
+# Só roda pelo botão "Run workflow". Chave de assinatura DESCARTÁVEL (gerada aqui).
+
+on:
+  workflow_dispatch:
+
+env:
+  GODOT_RELEASE: 4.7.1-stable
+  GODOT_TEMPLATES: 4.7.1.stable.mono
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  API_LEVEL: "35"
+  IMAGE: "system-images;android-35;google_apis_ps16k;x86_64"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        tfm: [net8.0, net10.0]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Componentes do Android SDK
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "build-tools;36.1.0" "platforms;android-36" "cmdline-tools;latest" | tail -3
+
+      - name: Instalar Godot mono e os templates de export
+        run: |
+          set -euo pipefail
+          base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_RELEASE}"
+          curl -fL --retry 3 -o godot.zip "${base}/Godot_v${GODOT_RELEASE}_mono_linux_x86_64.zip"
+          unzip -q godot.zip -d godot_app
+          curl -fL --retry 3 -o templates.tpz "${base}/Godot_v${GODOT_RELEASE}_mono_export_templates.tpz"
+          unzip -q templates.tpz -d tpl
+          dest="$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}"
+          mkdir -p "$dest"
+          mv tpl/templates/* "$dest/"
+          exe=$(find godot_app -type f -name "Godot_v*" ! -name "*.zip" | head -1)
+          chmod +x "$exe"
+          echo "GODOT=$PWD/$exe" >> "$GITHUB_ENV"
+
+      - name: Modelo de build do Android
+        run: |
+          set -euo pipefail
+          src="$HOME/.local/share/godot/export_templates/${GODOT_TEMPLATES}/android_source.zip"
+          mkdir -p android/build
+          unzip -q "$src" -d android/build
+          echo -n "${GODOT_TEMPLATES}" > android/.build_version
+          : > android/.gdignore
+          : > android/build/.gdignore
+          chmod +x android/build/gradlew
+
+      - name: Mirar o .NET da matriz só no Android
+        run: |
+          python3 - <<'PY'
+          tfm = "${{ matrix.tfm }}"
+          path = "IosProbe.csproj"
+          text = open(path, encoding="utf-8").read()
+          line = f'    <TargetFramework Condition="\'$(GodotTargetPlatform)\' == \'android\'">{tfm}</TargetFramework>\n'
+          text = text.replace("  </PropertyGroup>", line + "  </PropertyGroup>", 1)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+
+      - name: Preset de export do Android (AAB, x86_64 para o emulador)
+        run: |
+          cat >> export_presets.cfg <<'EOF'
+
+          [preset.1]
+
+          name="Android"
+          platform="Android"
+          runnable=true
+          advanced_options=false
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter="data/*"
+          exclude_filter=""
+          export_path="build/android/IosProbe.aab"
+          patches=PackedStringArray()
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          seed=0
+          encrypt_pck=false
+          encrypt_directory=false
+          script_export_mode=2
+
+          [preset.1.options]
+
+          gradle_build/use_gradle_build=true
+          gradle_build/gradle_build_directory=""
+          gradle_build/android_source_template=""
+          gradle_build/compress_native_libraries=false
+          gradle_build/export_format=1
+          gradle_build/min_sdk=""
+          gradle_build/target_sdk=""
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=false
+          architectures/x86=false
+          architectures/x86_64=true
+          version/code=1
+          version/name="1.0"
+          package/unique_name="com.example.iosprobe"
+          package/name="IosProbe"
+          package/signed=true
+          package/app_category=2
+          screen/immersive_mode=true
+          EOF
+
+      - name: Configurar o editor do Godot e a chave descartável
+        run: |
+          set -euo pipefail
+          "$GODOT" --headless --path . --quit 2>&1 | tail -3 || true
+          cfg=$(find "$HOME/.config/godot" -name "editor_settings-*.tres" | head -1 || true)
+          if [ -z "${cfg}" ]; then
+            mkdir -p "$HOME/.config/godot"; cfg="$HOME/.config/godot/editor_settings-4.7.tres"
+            printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\n' > "$cfg"
+          fi
+          printf 'export/android/android_sdk_path = "%s"\nexport/android/java_sdk_path = "%s"\n' "$ANDROID_HOME" "$JAVA_HOME" >> "$cfg"
+          keytool -genkeypair -v -keystore "$PWD/disposable.keystore" -storepass android -keypass android \
+            -alias probe -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=probe" > /dev/null 2>&1
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$PWD/disposable.keystore" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=probe" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=android" >> "$GITHUB_ENV"
+
+      - name: Importar e exportar o AAB de release
+        run: |
+          set -o pipefail
+          "$GODOT" --headless --path . --import 2>&1 | tee import.log || true
+          mkdir -p build/android
+          "$GODOT" --headless --path . --export-release "Android" build/android/IosProbe.aab 2>&1 | tee export.log
+          ls -la build/android
+
+      - name: Alinhamento de 16 KB das bibliotecas (informativo aqui; o teste de verdade é o emulador)
+        run: |
+          python3 tools/check_elf_alignment.py build/android/IosProbe.aab 2>&1 | tee alignment.log || true
+
+      - name: AAB para APK universal (bundletool)
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o bundletool.jar "https://github.com/google/bundletool/releases/download/1.18.1/bundletool-all-1.18.1.jar"
+          java -jar bundletool.jar build-apks --bundle=build/android/IosProbe.aab --output=build/android/IosProbe.apks --mode=universal \
+            --ks="$PWD/disposable.keystore" --ks-pass=pass:android --ks-key-alias=probe --key-pass=pass:android
+          unzip -o -q build/android/IosProbe.apks universal.apk -d build/android
+          ls -la build/android
+
+      - name: Habilitar KVM (aceleração do emulador)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -la /dev/kvm || true
+
+      - name: Criar o emulador com páginas de 16 KB
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
+          "$SDKMANAGER" "emulator" "${IMAGE}" | tail -3
+          echo no | "$AVDMANAGER" create avd -n sixteenkb -k "${IMAGE}" --device "pixel_6" --force
+          echo "$ANDROID_HOME/emulator" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Subir o emulador
+        run: |
+          set -euo pipefail
+          nohup "$ANDROID_HOME/emulator/emulator" -avd sixteenkb -no-window -no-audio -no-boot-anim -no-snapshot \
+            -gpu swiftshader_indirect -memory 3072 > emulator.log 2>&1 &
+          "$ANDROID_HOME/platform-tools/adb" wait-for-device
+          for i in $(seq 1 90); do
+            booted=$("$ANDROID_HOME/platform-tools/adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+            [ "$booted" = "1" ] && break
+            sleep 5
+          done
+          echo "boot_completed=$booted"
+          "$ANDROID_HOME/platform-tools/adb" shell getconf PAGE_SIZE
+          "$ANDROID_HOME/platform-tools/adb" shell uname -r
+
+      - name: Instalar, abrir o app e ler o log
+        run: |
+          set -o pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          "$ADB" logcat -c
+          "$ADB" install -r build/android/universal.apk 2>&1 | tee install.log || true
+          "$ADB" shell monkey -p com.example.iosprobe -c android.intent.category.LAUNCHER 1 2>&1 | tee launch.log || true
+          sleep 45
+          "$ADB" logcat -d > logcat_full.txt || true
+          echo "--- linhas relevantes"
+          grep -E "PROBE|FATAL EXCEPTION|AndroidRuntime|dlopen|Fatal signal|libmonosgen|ELF|page size|godot" logcat_full.txt | head -60 | tee logcat_relevant.txt || true
+          if grep -q "\[PROBE\] RESULT: PASS" logcat_full.txt; then echo "RESULTADO FINAL: o app ABRIU e deu PASS"; else echo "RESULTADO FINAL: o app NAO deu PASS"; exit 1; fi
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulador-${{ matrix.tfm }}
+          if-no-files-found: warn
+          path: |
+            alignment.log
+            export.log
+            install.log
+            launch.log
+            emulator.log
+            logcat_full.txt
+            logcat_relevant.txt
