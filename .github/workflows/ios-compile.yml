@@ -1,0 +1,83 @@
+name: iOS compile probe
+
+# Prova (ou derruba) que Godot 4.7.1 + C# (NativeAOT) exporta e compila para iOS, sem Mac e sem conta Apple.
+# Roda sozinho a cada push e também pelo botão "Run workflow" na aba Actions.
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  GODOT_RELEASE: 4.7.1-stable
+  GODOT_TEMPLATE_DIR: 4.7.1.stable.mono
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  ios-compile:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Instalar Godot mono e os templates de export
+        run: |
+          set -euo pipefail
+          base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_RELEASE}"
+          curl -fL --retry 3 -o godot.zip "${base}/Godot_v${GODOT_RELEASE}_mono_macos.universal.zip"
+          unzip -q godot.zip -d godot_app
+          curl -fL --retry 3 -o templates.tpz "${base}/Godot_v${GODOT_RELEASE}_mono_export_templates.tpz"
+          unzip -q templates.tpz -d tpl
+          dest="$HOME/Library/Application Support/Godot/export_templates/${GODOT_TEMPLATE_DIR}"
+          mkdir -p "$dest"
+          mv tpl/templates/* "$dest/"
+          ls "$dest" | head -50
+          echo "GODOT=$PWD/godot_app/Godot_mono.app/Contents/MacOS/Godot" >> "$GITHUB_ENV"
+
+      - name: Compilar a solução C# (sanidade)
+        run: dotnet build IosProbe.sln -c Release
+
+      - name: Importar o projeto (gera .godot)
+        run: |
+          "$GODOT" --headless --path . --import 2>&1 | tee import.log || true
+
+      - name: Exportar o projeto Xcode (inclui o publish NativeAOT do C#)
+        run: |
+          set -o pipefail
+          mkdir -p build/ios
+          "$GODOT" --headless --path . --export-release "iOS" build/ios/IosProbe.ipa 2>&1 | tee export.log
+          ls -la build/ios
+
+      - name: Compilar no Xcode sem assinar
+        run: |
+          set -o pipefail
+          xcodebuild -project build/ios/IosProbe.xcodeproj -scheme IosProbe \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Montar o .ipa sem assinatura (para instalar com AltStore/Sideloadly)
+        run: |
+          set -euo pipefail
+          app=$(find build/dd/Build/Products -maxdepth 2 -name "*.app" | head -1)
+          echo "app: $app"
+          rm -rf Payload && mkdir Payload && cp -R "$app" Payload/
+          zip -qr IosProbe-unsigned.ipa Payload
+          ls -la IosProbe-unsigned.ipa
+
+      - name: Guardar resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-probe-resultados
+          if-no-files-found: warn
+          path: |
+            import.log
+            export.log
+            xcodebuild.log
+            IosProbe-unsigned.ipa

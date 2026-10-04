@@ -1,0 +1,27 @@
+; Projeto MÍNIMO de teste: serve só para provar que Godot 4.7.1 + C# (NativeAOT) compila para iOS.
+; Não tem nada do jogo Mini Campus. Pode ser público.
+
+config_version=5
+
+[application]
+
+config/name="IosProbe"
+run/main_scene="res://Main.tscn"
+config/features=PackedStringArray("4.7", "C#", "GL Compatibility")
+config/icon="res://icon.svg"
+
+[display]
+
+window/size/viewport_width=960
+window/size/viewport_height=540
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+
+[dotnet]
+
+project/assembly_name="IosProbe"
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
